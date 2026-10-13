@@ -1,0 +1,11 @@
+Package: tt-tray
+Version: 0.1.0
+Section: utils
+Priority: optional
+Architecture: amd64
+Depends: libayatana-appindicator3-1
+Maintainer: patrice
+Description: Lanceur systray pour TurningTrade Terminal (mode headless)
+ Démarre hfq-server, rithmic-live et tt-agent en arrière-plan,
+ affiche une icône dans la barre système et ouvre le Terminal
+ dans le navigateur. Nécessite TurningTrade Terminal installé.

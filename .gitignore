@@ -1,0 +1,5 @@
+posts/
+
+# artefacts de build tt-tray
+tt-tray/tt-tray
+tt-tray/dist/

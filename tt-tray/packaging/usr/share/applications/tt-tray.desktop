@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=TurningTrade Tray
+Comment=Lance les services TurningTrade en arrière-plan (icône systray)
+Exec=tt-tray
+Icon=tt-tray
+Terminal=false
+Type=Application
+Categories=Office;Finance;
+StartupWMClass=tt-tray
+X-GNOME-Autostart-enabled=true
