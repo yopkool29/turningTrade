@@ -11,5 +11,3 @@ cd tt-tray
 go build -o tt-tray .   # binaire seul
 ./build-deb.sh          # paquet .deb dans dist/
 ```
-
-La doc et les posts du projet sont gérés dans campaign-pilot (namespace `TurningTrade`).
