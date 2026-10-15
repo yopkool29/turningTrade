@@ -5,9 +5,12 @@ package main
 
 import (
 	_ "embed"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,10 +26,20 @@ import (
 var iconPNG []byte
 
 const (
-	payloadDir  = "/usr/lib/TurningTrade Terminal/payload"
-	terminalURL = "http://127.0.0.1:8765/hfq-terminal.html"
-	agentURL    = "http://127.0.0.1:9199/"
+	payloadDir   = "/usr/lib/TurningTrade Terminal/payload"
+	terminalURL  = "http://127.0.0.1:8765/hfq-terminal.html"
+	agentURL     = "http://127.0.0.1:9199/"
+	downloadURL  = "https://www.turningtrade.com/telecharger"
+	manifestBase = "https://pub-ce01ba38458d4cf3a4355adbb56de991.r2.dev/desktop/terminal"
 )
+
+// manifests Tauri publiés par plateforme — linux-x86_64 n'existe pas encore,
+// on le sonde quand même : le jour où le canal s'ouvre, il est pris en compte.
+var manifestNames = []string{
+	"latest-linux-x86_64.json",
+	"latest-windows-x86_64.json",
+	"latest-darwin-aarch64.json",
+}
 
 var (
 	homeDir = os.Getenv("HOME")
@@ -101,15 +114,35 @@ func listeningInode(port int) string {
 	return ""
 }
 
-// killTree tue le process-group du PID (repli : le PID seul).
+// killTree tue le PID — et tout son process-group seulement s'il en est le
+// chef (groupe dédié, ex. nos services lancés avec Setpgid). Si le PID partage
+// le groupe d'un lanceur ou de la session (hfq-desktop ouvert via appfinder…),
+// on ne tue que le PID : un kill groupé emporterait des processus sans rapport
+// (xfsettingsd → raccourcis clavier morts).
 func killTree(pid int) {
 	target := pid
-	if pgid, err := syscall.Getpgid(pid); err == nil && pgid > 0 && pgid != pidPgidSelf() {
-		target = -pgid // ne jamais tuer notre propre groupe
+	if pgid, err := syscall.Getpgid(pid); err == nil && pgid == pid && pgid != pidPgidSelf() {
+		target = -pgid // chef d'un groupe dédié → kill groupé
 	}
 	syscall.Kill(target, syscall.SIGTERM)
 	time.Sleep(400 * time.Millisecond)
 	syscall.Kill(target, syscall.SIGKILL)
+}
+
+// killPorts tue tout ce qui écoute encore sur les ports donnés, quel que soit
+// le nom du processus — couvre les fils renommés, les orphelins hors du
+// process-group tué et les éventuels respawns (cause du « doublon :8765 »).
+func killPorts(ports ...int) {
+	for _, p := range ports {
+		for i := 0; i < 8; i++ {
+			pid := pidOnPort(p)
+			if pid == 0 || pid == os.Getpid() {
+				break
+			}
+			log.Printf("port %d encore pris par pid=%d → kill", p, pid)
+			killTree(pid)
+		}
+	}
 }
 
 func pidPgidSelf() int {
@@ -128,20 +161,27 @@ var ttCommNames = map[string]bool{
 
 // sweepAll tue tous les processus TurningTrade, y compris ceux qui n'ont pas
 // été lancés par tt-tray (fenêtre hfq-desktop, node du tt-agent, enfants du
-// serveur). Ne touche jamais notre propre process-group.
+// serveur) ainsi que tous leurs descendants — webview WebKit & co — même sous
+// un autre nom. Ne touche jamais notre propre process-group.
 func sweepAll() {
 	self := os.Getpid()
-	entries, _ := os.ReadDir("/proc")
-	for _, e := range entries {
+	selfPgid := pidPgidSelf()
+	protege := func(pid int) bool {
+		g, err := syscall.Getpgid(pid)
+		return err == nil && g == selfPgid
+	}
+	// table parent -> enfants pour attraper les fils renommés (ex. WebKitWebProcess)
+	arbre := arbreProcessus()
+	var racines []int
+	noms := map[int]string{}
+	for _, e := range mustReadDir("/proc") {
 		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid == self {
-			continue
-		}
-		if g, err := syscall.Getpgid(pid); err == nil && g == pidPgidSelf() {
+		if err != nil || pid == self || protege(pid) {
 			continue
 		}
 		comm, _ := os.ReadFile(filepath.Join("/proc", e.Name(), "comm"))
 		name := strings.TrimSpace(string(comm))
+		noms[pid] = name
 		estTT := ttCommNames[name]
 		if !estTT {
 			// le binaire du tt-agent se renomme "MainThread" — on matche sa cmdline
@@ -151,10 +191,71 @@ func sweepAll() {
 			}
 		}
 		if estTT {
-			log.Printf("nettoyage : %s pid=%d", name, pid)
-			killTree(pid)
+			racines = append(racines, pid)
 		}
 	}
+	// élargit aux descendants avant toute exécution (sinon ils seraient orphelins)
+	cibles := map[int]bool{}
+	for _, r := range racines {
+		cibles[r] = true
+		for _, d := range descendants(r, arbre) {
+			cibles[d] = true
+		}
+	}
+	for pid := range cibles {
+		if pid == self || protege(pid) {
+			continue
+		}
+		log.Printf("nettoyage : %s pid=%d", noms[pid], pid)
+		killTree(pid)
+	}
+}
+
+func mustReadDir(name string) []os.DirEntry {
+	entries, _ := os.ReadDir(name)
+	return entries
+}
+
+// arbreProcessus : table parent -> enfants construite depuis /proc/*/stat.
+func arbreProcessus() map[int][]int {
+	arbre := map[int][]int{}
+	for _, e := range mustReadDir("/proc") {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		st, err := os.ReadFile(filepath.Join("/proc", e.Name(), "stat"))
+		if err != nil {
+			continue
+		}
+		if i := strings.LastIndexByte(string(st), ')'); i >= 0 {
+			if f := strings.Fields(string(st[i+2:])); len(f) >= 2 {
+				if ppid, err := strconv.Atoi(f[1]); err == nil {
+					arbre[ppid] = append(arbre[ppid], pid)
+				}
+			}
+		}
+	}
+	return arbre
+}
+
+// descendants : tous les descendants de pid (fils, petits-fils…), quel que
+// soit leur nom ou leur process-group.
+func descendants(pid int, arbre map[int][]int) []int {
+	var out []int
+	vu := map[int]bool{}
+	var marcher func(int)
+	marcher = func(p int) {
+		for _, c := range arbre[p] {
+			if !vu[c] {
+				vu[c] = true
+				out = append(out, c)
+				marcher(c)
+			}
+		}
+	}
+	marcher(pid)
+	return out
 }
 
 func (s *service) running() bool {
@@ -229,7 +330,14 @@ func (s *service) stop() {
 		return
 	}
 	log.Printf("%s : arrêt pid=%d", s.name, pid)
+	arbre := arbreProcessus()
 	killTree(pid)
+	for _, d := range descendants(pid, arbre) { // service externe : groupe partagé → tuer les fils un par un
+		if d != os.Getpid() {
+			killTree(d)
+		}
+	}
+	killPorts(s.port) // le port doit être réellement libéré
 }
 
 func services() []*service {
@@ -287,6 +395,95 @@ func singleInstance() {
 
 func openURL(u string) { exec.Command("xdg-open", u).Start() }
 
+// ---------- check de version ----------
+
+func installedVersion() string {
+	out, err := exec.Command("dpkg-query", "-W", "-f=${Version}", "turning-trade-terminal").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// versionNewer : a strictement plus récente que b (comparaison par segments numériques).
+func versionNewer(a, b string) bool {
+	as, bs := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(as) || i < len(bs); i++ {
+		var x, y int
+		if i < len(as) {
+			x, _ = strconv.Atoi(as[i])
+		}
+		if i < len(bs) {
+			y, _ = strconv.Atoi(bs[i])
+		}
+		if x != y {
+			return x > y
+		}
+	}
+	return false
+}
+
+// latestPublished : plus haute version publiée parmi les manifests de toutes
+// les plateformes (le .deb du site est l'app *journal*, pas le terminal).
+func latestPublished() string {
+	cli := &http.Client{Timeout: 10 * time.Second}
+	best := ""
+	for _, name := range manifestNames {
+		resp, err := cli.Get(manifestBase + "/" + name)
+		if err != nil {
+			continue
+		}
+		var m struct {
+			Version string `json:"version"`
+		}
+		json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&m)
+		resp.Body.Close()
+		if m.Version != "" && (best == "" || versionNewer(m.Version, best)) {
+			best = m.Version
+		}
+	}
+	return best
+}
+
+var (
+	updLastPub  string // dernière version publiée vue
+	updNotified string // version déjà notifiée (une notif par version)
+	updChecking bool
+)
+
+func checkUpdate(item *systray.MenuItem) {
+	if updChecking {
+		return
+	}
+	updChecking = true
+	defer func() { updChecking = false }()
+	pub, inst := latestPublished(), installedVersion()
+	updLastPub = pub
+	switch {
+	case pub == "":
+		item.SetTitle("Màj : site injoignable")
+	case inst == "":
+		item.SetTitle(fmt.Sprintf("Màj : %s publiée (paquet non installé)", pub))
+	case versionNewer(pub, inst):
+		item.SetTitle(fmt.Sprintf("Màj : %s dispo (installée %s) — télécharger", pub, inst))
+		if updNotified != pub {
+			updNotified = pub
+			log.Printf("nouvelle version publiée : %s (installée %s)", pub, inst)
+			exec.Command("notify-send", "TurningTrade",
+				fmt.Sprintf("Nouvelle version publiée : %s (installée : %s)", pub, inst)).Run()
+		}
+	case versionNewer(inst, pub):
+		item.SetTitle(fmt.Sprintf("Màj : %s installée, site à %s (build non publié)", inst, pub))
+	default:
+		item.SetTitle("Màj : à jour (" + inst + ")")
+	}
+}
+
+// updateAvailable : vrai si la dernière version publiée dépasse l'installée.
+func updateAvailable() bool {
+	return updLastPub != "" && installedVersion() != "" && versionNewer(updLastPub, installedVersion())
+}
+
 func main() {
 	singleInstance()
 	os.MkdirAll(logDir, 0o755)
@@ -315,6 +512,7 @@ func onReady(svcs []*service) {
 		s.item = systray.AddMenuItem(s.name+" : …", s.bin)
 	}
 	mLogs := systray.AddMenuItem("Ouvrir les logs", logDir)
+	mUpdate := systray.AddMenuItem("Màj : vérification…", "Compare la version installée à la dernière publiée")
 	systray.AddSeparator()
 	mStartAll := systray.AddMenuItem("Tout démarrer", "Démarre hfq-server + tt-agent (rithmic-live suit à la connexion)")
 	mStopAll := systray.AddMenuItem("Tout arrêter", "Tue tous les processus TurningTrade, même ceux lancés hors du tray")
@@ -342,6 +540,12 @@ func onReady(svcs []*service) {
 				openURL(agentURL)
 			case <-mLogs.ClickedCh:
 				openURL("file://" + logDir)
+			case <-mUpdate.ClickedCh:
+				if updateAvailable() {
+					openURL(downloadURL)
+				} else {
+					go checkUpdate(mUpdate)
+				}
 			case <-mStartAll.ClickedCh:
 				for _, s := range svcs {
 					s.start()
@@ -361,6 +565,9 @@ func onReady(svcs []*service) {
 				for _, s := range svcs {
 					s.cmd = nil
 				}
+				// balayage par port : tue aussi ce que le sweep par nom a raté
+				// (8766 = journal hfq-server, 9200 = webhook tt-agent)
+				killPorts(8765, 8766, 8792, 9199, 9200)
 				log.Println("nettoyage terminé")
 			case <-mQuit.ClickedCh:
 				systray.Quit()
@@ -392,6 +599,14 @@ func onReady(svcs []*service) {
 				}
 				s.item.SetTitle(fmt.Sprintf("%s : %s (:%d)", s.name, label, s.port))
 			}
+		}
+	}()
+
+	go func() { // check de version : 15 s après le démarrage, puis toutes les 2 h
+		time.Sleep(15 * time.Second)
+		checkUpdate(mUpdate)
+		for range time.Tick(2 * time.Hour) {
+			checkUpdate(mUpdate)
 		}
 	}()
 
