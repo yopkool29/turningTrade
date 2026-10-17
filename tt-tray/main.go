@@ -159,24 +159,44 @@ var ttCommNames = map[string]bool{
 	"rithmic-live": true,
 }
 
+// ppidOf lit le PPID d'un PID depuis /proc/<pid>/stat.
+func ppidOf(pid int) int {
+	st, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0
+	}
+	if i := strings.LastIndexByte(string(st), ')'); i >= 0 {
+		if f := strings.Fields(string(st[i+2:])); len(f) >= 2 {
+			p, _ := strconv.Atoi(f[1])
+			return p
+		}
+	}
+	return 0
+}
+
 // sweepAll tue tous les processus TurningTrade, y compris ceux qui n'ont pas
 // été lancés par tt-tray (fenêtre hfq-desktop, node du tt-agent, enfants du
 // serveur) ainsi que tous leurs descendants — webview WebKit & co — même sous
-// un autre nom. Ne touche jamais notre propre process-group.
+// un autre nom. Ne protège que le tray, ses ancêtres et SES descendants :
+// « même process-group » est trop large — hfq-desktop lancé depuis le même
+// shell partage le pgid du tray et n'était jamais tué.
 func sweepAll() {
 	self := os.Getpid()
-	selfPgid := pidPgidSelf()
-	protege := func(pid int) bool {
-		g, err := syscall.Getpgid(pid)
-		return err == nil && g == selfPgid
+	arbre := arbreProcessus()
+	proteges := map[int]bool{self: true}
+	for _, d := range descendants(self, arbre) {
+		proteges[d] = true
+	}
+	for p := ppidOf(self); p > 1 && !proteges[p]; { // ancêtres jusqu'à init
+		proteges[p] = true
+		p = ppidOf(p)
 	}
 	// table parent -> enfants pour attraper les fils renommés (ex. WebKitWebProcess)
-	arbre := arbreProcessus()
 	var racines []int
 	noms := map[int]string{}
 	for _, e := range mustReadDir("/proc") {
 		pid, err := strconv.Atoi(e.Name())
-		if err != nil || pid == self || protege(pid) {
+		if err != nil || proteges[pid] {
 			continue
 		}
 		comm, _ := os.ReadFile(filepath.Join("/proc", e.Name(), "comm"))
@@ -203,7 +223,7 @@ func sweepAll() {
 		}
 	}
 	for pid := range cibles {
-		if pid == self || protege(pid) {
+		if proteges[pid] {
 			continue
 		}
 		log.Printf("nettoyage : %s pid=%d", noms[pid], pid)
@@ -508,14 +528,40 @@ func onReady(svcs []*service) {
 	mTerm := systray.AddMenuItem("Ouvrir le Terminal", "http://127.0.0.1:8765")
 	mAgent := systray.AddMenuItem("Ouvrir TT Agent", "http://127.0.0.1:9199")
 	systray.AddSeparator()
+	mServices := systray.AddMenuItem("Services", "Démarrer/arrêter les processus")
+	mStartAll := mServices.AddSubMenuItem("Tout démarrer", "Démarre hfq-server + tt-agent (rithmic-live suit à la connexion)")
+	mStopAll := mServices.AddSubMenuItem("Tout arrêter", "Tue tous les processus TurningTrade, même ceux lancés hors du tray")
 	for _, s := range svcs {
-		s.item = systray.AddMenuItem(s.name+" : …", s.bin)
+		s.item = mServices.AddSubMenuItem(s.name+" : …", s.bin)
 	}
-	mLogs := systray.AddMenuItem("Ouvrir les logs", logDir)
+	mLogs := systray.AddMenuItem("Logs", logDir)
+	type logEntry struct {
+		label, file string
+	}
+	logFiles := []logEntry{{"Dossier", ""}, {"tt-tray", "tt-tray.log"}}
+	for _, s := range svcs {
+		logFiles = append(logFiles, logEntry{s.name, s.name + ".log"})
+	}
+	for _, lf := range logFiles {
+		it := mLogs.AddSubMenuItem(lf.label, lf.file)
+		p := logDir
+		if lf.file != "" {
+			p = filepath.Join(logDir, lf.file)
+		}
+		go func(item *systray.MenuItem, path string, isDir bool) {
+			for range item.ClickedCh {
+				if !isDir {
+					if f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND, 0o644); err == nil {
+						f.Close()
+					}
+				}
+				openURL("file://" + path)
+			}
+		}(it, p, lf.file == "")
+	}
+	mExt := systray.AddMenuItem("Ouvrir les indicateurs", filepath.Join(dataDir, "extensions"))
 	mUpdate := systray.AddMenuItem("Màj : vérification…", "Compare la version installée à la dernière publiée")
 	systray.AddSeparator()
-	mStartAll := systray.AddMenuItem("Tout démarrer", "Démarre hfq-server + tt-agent (rithmic-live suit à la connexion)")
-	mStopAll := systray.AddMenuItem("Tout arrêter", "Tue tous les processus TurningTrade, même ceux lancés hors du tray")
 	mQuit := systray.AddMenuItem("Quitter", "Arrête les services lancés par tt-tray")
 
 	for _, s := range svcs {
@@ -538,8 +584,9 @@ func onReady(svcs []*service) {
 				openURL(terminalURL)
 			case <-mAgent.ClickedCh:
 				openURL(agentURL)
-			case <-mLogs.ClickedCh:
-				openURL("file://" + logDir)
+			case <-mExt.ClickedCh:
+				os.MkdirAll(filepath.Join(dataDir, "extensions"), 0o755)
+				openURL("file://" + filepath.Join(dataDir, "extensions"))
 			case <-mUpdate.ClickedCh:
 				if updateAvailable() {
 					openURL(downloadURL)
@@ -550,15 +597,6 @@ func onReady(svcs []*service) {
 				for _, s := range svcs {
 					s.start()
 				}
-				go func() { // rouvre le terminal quand le serveur répond
-					for i := 0; i < 30; i++ {
-						if portOpen(8765) {
-							openURL(terminalURL)
-							return
-						}
-						time.Sleep(500 * time.Millisecond)
-					}
-				}()
 			case <-mStopAll.ClickedCh:
 				log.Println("nettoyage complet demandé")
 				sweepAll()
@@ -610,13 +648,4 @@ func onReady(svcs []*service) {
 		}
 	}()
 
-	go func() { // ouvre le navigateur quand le terminal répond
-		for i := 0; i < 60; i++ {
-			if portOpen(8765) {
-				openURL(terminalURL)
-				return
-			}
-			time.Sleep(500 * time.Millisecond)
-		}
-	}()
 }

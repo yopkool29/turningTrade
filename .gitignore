@@ -1,6 +1,9 @@
 posts/
 bugs/
 
+# secrets MCP locaux (token bearer)
+.devin/mcp_config.local.json
+
 # artefacts de build tt-tray
 tt-tray/tt-tray
 tt-tray/dist/
