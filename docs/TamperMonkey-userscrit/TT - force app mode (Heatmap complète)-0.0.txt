@@ -1,0 +1,10 @@
+// ==UserScript==
+// @name         TT - force app mode (Heatmap complète)
+// @match        http://127.0.0.1:8765/*
+// @match        http://localhost:8765/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+window.__TAURI_INTERNALS__ = {};
+window.__TAURI_INTERNALS__ = { transformCallback(){}, invoke(){ return Promise.reject(); } };
