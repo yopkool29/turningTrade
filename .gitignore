@@ -7,3 +7,4 @@ bugs/
 # artefacts de build tt-tray
 tt-tray/tt-tray
 tt-tray/dist/
+tt-tray/packaging/usr/bin/

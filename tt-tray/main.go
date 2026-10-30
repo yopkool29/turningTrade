@@ -4,6 +4,9 @@
 package main
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	_ "embed"
 	"encoding/json"
 	"fmt"
@@ -31,10 +34,11 @@ const (
 	agentURL     = "http://127.0.0.1:9199/"
 	downloadURL  = "https://www.turningtrade.com/telecharger"
 	manifestBase = "https://pub-ce01ba38458d4cf3a4355adbb56de991.r2.dev/desktop/terminal"
+	debURL       = manifestBase + "/TurningTrade-Terminal-Linux-amd64.deb"
 )
 
-// manifests Tauri publiés par plateforme — linux-x86_64 n'existe pas encore,
-// on le sonde quand même : le jour où le canal s'ouvre, il est pris en compte.
+// manifests Tauri historiques — périmés côté serveur (win 0.4.5, mac 0.4.2,
+// linux 404), gardés en repli si la lecture du .deb échoue.
 var manifestNames = []string{
 	"latest-linux-x86_64.json",
 	"latest-windows-x86_64.json",
@@ -443,9 +447,12 @@ func versionNewer(a, b string) bool {
 	return false
 }
 
-// latestPublished : plus haute version publiée parmi les manifests de toutes
-// les plateformes (le .deb du site est l'app *journal*, pas le terminal).
+// latestPublished : version du .deb publié sur le site (nom de fichier fixe,
+// écrasé à chaque release). Repli sur les manifests Tauri si la lecture échoue.
 func latestPublished() string {
+	if v := publishedDebVersion(); v != "" {
+		return v
+	}
 	cli := &http.Client{Timeout: 10 * time.Second}
 	best := ""
 	for _, name := range manifestNames {
@@ -463,6 +470,91 @@ func latestPublished() string {
 		}
 	}
 	return best
+}
+
+// publishedDebVersion : lit le champ Version du control.tar en tête du .deb
+// publié — une requête Range de 256 Ko suffit, pas besoin des ~500 Mo.
+func publishedDebVersion() string {
+	req, err := http.NewRequest("GET", debURL, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Range", "bytes=0-262143")
+	cli := &http.Client{Timeout: 15 * time.Second}
+	resp, err := cli.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return ""
+	}
+	head, err := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
+	if err != nil {
+		return ""
+	}
+	return debControlVersion(head)
+}
+
+// debControlVersion : parcourt les membres de l'archive ar et extrait la
+// Version du fichier control (control.tar.gz uniquement — xz/zst non gérés).
+func debControlVersion(buf []byte) string {
+	if len(buf) < 68 || string(buf[:8]) != "!<arch>\n" {
+		return ""
+	}
+	pos := 8
+	for pos+60 <= len(buf) {
+		hdr := buf[pos : pos+60]
+		name := strings.TrimSpace(string(hdr[:16]))
+		size, err := strconv.Atoi(strings.TrimSpace(string(hdr[48:58])))
+		if err != nil || size < 0 {
+			return ""
+		}
+		body := buf[pos+60:]
+		if len(body) > size {
+			body = body[:size]
+		}
+		if strings.HasPrefix(name, "control.tar") {
+			return tarControlVersion(name, body)
+		}
+		pos += 60 + size + size%2
+	}
+	return ""
+}
+
+func tarControlVersion(name string, blob []byte) string {
+	var r io.Reader = bytes.NewReader(blob)
+	switch {
+	case strings.HasSuffix(name, ".gz"):
+		gz, err := gzip.NewReader(r)
+		if err != nil {
+			return ""
+		}
+		defer gz.Close()
+		r = gz
+	case !strings.HasSuffix(name, ".tar"):
+		return ""
+	}
+	tr := tar.NewReader(r)
+	for {
+		h, err := tr.Next()
+		if err != nil {
+			return ""
+		}
+		if filepath.Base(h.Name) != "control" {
+			continue
+		}
+		b, err := io.ReadAll(io.LimitReader(tr, 64<<10))
+		if err != nil {
+			return ""
+		}
+		for _, line := range strings.Split(string(b), "\n") {
+			if v, ok := strings.CutPrefix(line, "Version:"); ok {
+				return strings.TrimSpace(v)
+			}
+		}
+		return ""
+	}
 }
 
 var (
