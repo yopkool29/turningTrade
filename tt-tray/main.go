@@ -569,8 +569,21 @@ func checkUpdate(item *systray.MenuItem) {
 	}
 	updChecking = true
 	defer func() { updChecking = false }()
-	pub, inst := latestPublished(), installedVersion()
+	pub := latestPublished()
 	updLastPub = pub
+	updateLabel(item, pub, installedVersion())
+}
+
+// refreshUpdateLabel : recalcule le libellé avec la version publiée en cache —
+// pas de réseau, rattrape une install/désinstall faite entre deux checks.
+func refreshUpdateLabel(item *systray.MenuItem) {
+	if updLastPub == "" {
+		return
+	}
+	updateLabel(item, updLastPub, installedVersion())
+}
+
+func updateLabel(item *systray.MenuItem, pub, inst string) {
 	switch {
 	case pub == "":
 		item.SetTitle("Màj : site injoignable")
@@ -707,7 +720,12 @@ func onReady(svcs []*service) {
 	}()
 
 	go func() {
+		n := 0
 		for range time.Tick(2 * time.Second) {
+			n++
+			if n%30 == 0 { // chaque minute : rafraîchit le libellé Màj (local, sans réseau)
+				refreshUpdateLabel(mUpdate)
+			}
 			for _, s := range svcs {
 				// auto-heal : un fils gelé (SIGSTOP/SIGTSTP → état T) est réveillé
 				if s.cmd != nil && s.cmd.Process != nil && s.cmd.ProcessState == nil {
