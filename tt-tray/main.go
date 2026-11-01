@@ -4,10 +4,6 @@
 package main
 
 import (
-	"archive/tar"
-	"bytes"
-	"compress/gzip"
-	_ "embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,26 +15,20 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/getlantern/systray"
 )
 
-//go:embed icon.png
-var iconPNG []byte
-
 const (
-	payloadDir   = "/usr/lib/TurningTrade Terminal/payload"
 	terminalURL  = "http://127.0.0.1:8765/hfq-terminal.html"
 	agentURL     = "http://127.0.0.1:9199/"
 	downloadURL  = "https://www.turningtrade.com/telecharger"
 	manifestBase = "https://pub-ce01ba38458d4cf3a4355adbb56de991.r2.dev/desktop/terminal"
-	debURL       = manifestBase + "/TurningTrade-Terminal-Linux-amd64.deb"
 )
 
 // manifests Tauri historiques — périmés côté serveur (win 0.4.5, mac 0.4.2,
-// linux 404), gardés en repli si la lecture du .deb échoue.
+// linux 404), gardés en repli si la lecture du paquet publié échoue.
 var manifestNames = []string{
 	"latest-linux-x86_64.json",
 	"latest-windows-x86_64.json",
@@ -46,10 +36,17 @@ var manifestNames = []string{
 }
 
 var (
-	homeDir = os.Getenv("HOME")
-	dataDir = filepath.Join(homeDir, ".local", "share", "TurningTrade")
-	logDir  = filepath.Join(dataDir, "logs")
+	payloadDir = envOr("TT_PAYLOAD_DIR", plat.payloadDir())
+	dataDir    = envOr("TT_DATA_DIR", plat.dataDir())
+	logDir     = filepath.Join(dataDir, "logs")
 )
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
 
 type service struct {
 	name    string
@@ -72,193 +69,27 @@ func portOpen(port int) bool {
 	return true
 }
 
-// pidOnPort retrouve le PID qui écoute sur un port TCP (via /proc, sans dépendance).
-func pidOnPort(port int) int {
-	inode := listeningInode(port)
-	if inode == "" {
-		return 0
-	}
-	entries, _ := os.ReadDir("/proc")
-	for _, e := range entries {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
-		}
-		fds, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
-		if err != nil {
-			continue
-		}
-		for _, fd := range fds {
-			l, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", pid, fd.Name()))
-			if err == nil && l == "socket:["+inode+"]" {
-				return pid
-			}
-		}
-	}
-	return 0
-}
-
-func listeningInode(port int) string {
-	for _, f := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
-		data, err := os.ReadFile(f)
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(string(data), "\n")[1:] {
-			fields := strings.Fields(line)
-			// local_address = IP:PORT hex, st 0A = LISTEN, inode = champ 9
-			if len(fields) < 10 || fields[3] != "0A" {
-				continue
-			}
-			if strings.HasSuffix(fields[1], fmt.Sprintf(":%04X", port)) {
-				return fields[9]
-			}
-		}
-	}
-	return ""
-}
-
-// killTree tue le PID — et tout son process-group seulement s'il en est le
-// chef (groupe dédié, ex. nos services lancés avec Setpgid). Si le PID partage
-// le groupe d'un lanceur ou de la session (hfq-desktop ouvert via appfinder…),
-// on ne tue que le PID : un kill groupé emporterait des processus sans rapport
-// (xfsettingsd → raccourcis clavier morts).
-func killTree(pid int) {
-	target := pid
-	if pgid, err := syscall.Getpgid(pid); err == nil && pgid == pid && pgid != pidPgidSelf() {
-		target = -pgid // chef d'un groupe dédié → kill groupé
-	}
-	syscall.Kill(target, syscall.SIGTERM)
-	time.Sleep(400 * time.Millisecond)
-	syscall.Kill(target, syscall.SIGKILL)
-}
-
 // killPorts tue tout ce qui écoute encore sur les ports donnés, quel que soit
-// le nom du processus — couvre les fils renommés, les orphelins hors du
-// process-group tué et les éventuels respawns (cause du « doublon :8765 »).
+// le nom du processus — couvre les fils renommés, les orphelins hors de
+// l'arbre tué et les éventuels respawns (cause du « doublon :8765 »).
 func killPorts(ports ...int) {
 	for _, p := range ports {
 		for i := 0; i < 8; i++ {
-			pid := pidOnPort(p)
+			pid := plat.pidOnPort(p)
 			if pid == 0 || pid == os.Getpid() {
 				break
 			}
 			log.Printf("port %d encore pris par pid=%d → kill", p, pid)
-			killTree(pid)
+			plat.killTree(pid)
 		}
 	}
 }
 
-func pidPgidSelf() int {
-	if g, err := syscall.Getpgid(os.Getpid()); err == nil {
-		return g
-	}
-	return 0
-}
-
-// ttCommNames : noms de processus (comm exacts) appartenant à TurningTrade.
-var ttCommNames = map[string]bool{
-	"hfq-desktop":  true,
-	"hfq-server":   true,
-	"rithmic-live": true,
-}
-
-// ppidOf lit le PPID d'un PID depuis /proc/<pid>/stat.
-func ppidOf(pid int) int {
-	st, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
-	if err != nil {
-		return 0
-	}
-	if i := strings.LastIndexByte(string(st), ')'); i >= 0 {
-		if f := strings.Fields(string(st[i+2:])); len(f) >= 2 {
-			p, _ := strconv.Atoi(f[1])
-			return p
-		}
-	}
-	return 0
-}
-
-// sweepAll tue tous les processus TurningTrade, y compris ceux qui n'ont pas
-// été lancés par tt-tray (fenêtre hfq-desktop, node du tt-agent, enfants du
-// serveur) ainsi que tous leurs descendants — webview WebKit & co — même sous
-// un autre nom. Ne protège que le tray, ses ancêtres et SES descendants :
-// « même process-group » est trop large — hfq-desktop lancé depuis le même
-// shell partage le pgid du tray et n'était jamais tué.
-func sweepAll() {
-	self := os.Getpid()
-	arbre := arbreProcessus()
-	proteges := map[int]bool{self: true}
-	for _, d := range descendants(self, arbre) {
-		proteges[d] = true
-	}
-	for p := ppidOf(self); p > 1 && !proteges[p]; { // ancêtres jusqu'à init
-		proteges[p] = true
-		p = ppidOf(p)
-	}
-	// table parent -> enfants pour attraper les fils renommés (ex. WebKitWebProcess)
-	var racines []int
-	noms := map[int]string{}
-	for _, e := range mustReadDir("/proc") {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil || proteges[pid] {
-			continue
-		}
-		comm, _ := os.ReadFile(filepath.Join("/proc", e.Name(), "comm"))
-		name := strings.TrimSpace(string(comm))
-		noms[pid] = name
-		estTT := ttCommNames[name]
-		if !estTT {
-			// le binaire du tt-agent se renomme "MainThread" — on matche sa cmdline
-			if cl, _ := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline")); strings.Contains(string(cl), "tt-agent/server/index.js") {
-				estTT = true
-				name = "tt-agent"
-			}
-		}
-		if estTT {
-			racines = append(racines, pid)
-		}
-	}
-	// élargit aux descendants avant toute exécution (sinon ils seraient orphelins)
-	cibles := map[int]bool{}
-	for _, r := range racines {
-		cibles[r] = true
-		for _, d := range descendants(r, arbre) {
-			cibles[d] = true
-		}
-	}
-	for pid := range cibles {
-		if proteges[pid] {
-			continue
-		}
-		log.Printf("nettoyage : %s pid=%d", noms[pid], pid)
-		killTree(pid)
-	}
-}
-
-func mustReadDir(name string) []os.DirEntry {
-	entries, _ := os.ReadDir(name)
-	return entries
-}
-
-// arbreProcessus : table parent -> enfants construite depuis /proc/*/stat.
+// arbreProcessus : table parent -> enfants construite depuis le snapshot OS.
 func arbreProcessus() map[int][]int {
 	arbre := map[int][]int{}
-	for _, e := range mustReadDir("/proc") {
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
-		}
-		st, err := os.ReadFile(filepath.Join("/proc", e.Name(), "stat"))
-		if err != nil {
-			continue
-		}
-		if i := strings.LastIndexByte(string(st), ')'); i >= 0 {
-			if f := strings.Fields(string(st[i+2:])); len(f) >= 2 {
-				if ppid, err := strconv.Atoi(f[1]); err == nil {
-					arbre[ppid] = append(arbre[ppid], pid)
-				}
-			}
-		}
+	for _, p := range plat.procs() {
+		arbre[p.ppid] = append(arbre[p.ppid], p.pid)
 	}
 	return arbre
 }
@@ -282,6 +113,57 @@ func descendants(pid int, arbre map[int][]int) []int {
 	return out
 }
 
+// sweepAll tue tous les processus TurningTrade, y compris ceux qui n'ont pas
+// été lancés par tt-tray (fenêtre hfq-desktop, node du tt-agent, enfants du
+// serveur) ainsi que tous leurs descendants. Ne protège que le tray, ses
+// ancêtres et SES descendants.
+func sweepAll() {
+	self := os.Getpid()
+	procs := plat.procs()
+	byPid := map[int]procInfo{}
+	arbre := map[int][]int{}
+	for _, p := range procs {
+		byPid[p.pid] = p
+		arbre[p.ppid] = append(arbre[p.ppid], p.pid)
+	}
+	proteges := map[int]bool{self: true}
+	for _, d := range descendants(self, arbre) {
+		proteges[d] = true
+	}
+	for p := byPid[self].ppid; p > 0 && !proteges[p]; { // ancêtres jusqu'à la racine
+		proteges[p] = true
+		a, ok := byPid[p]
+		if !ok {
+			break
+		}
+		p = a.ppid
+	}
+	var racines []int
+	noms := map[int]string{}
+	for _, p := range procs {
+		if proteges[p.pid] || !plat.isTTProc(p) {
+			continue
+		}
+		noms[p.pid] = p.name
+		racines = append(racines, p.pid)
+	}
+	// élargit aux descendants avant toute exécution (sinon ils seraient orphelins)
+	cibles := map[int]bool{}
+	for _, r := range racines {
+		cibles[r] = true
+		for _, d := range descendants(r, arbre) {
+			cibles[d] = true
+		}
+	}
+	for pid := range cibles {
+		if proteges[pid] {
+			continue
+		}
+		log.Printf("nettoyage : %s pid=%d", noms[pid], pid)
+		plat.killTree(pid)
+	}
+}
+
 func (s *service) running() bool {
 	if s.cmd != nil && s.cmd.ProcessState == nil {
 		return true
@@ -292,7 +174,7 @@ func (s *service) running() bool {
 // rithmicEnvHasPassword : vrai si l'utilisateur a mis son mot de passe en clair
 // dans rithmic.env → permet de lancer rithmic-live sans passer par hfq-server.
 func rithmicEnvHasPassword() bool {
-	data, err := os.ReadFile(dataDir + "/native/rithmic/config/rithmic.env")
+	data, err := os.ReadFile(filepath.Join(dataDir, "native", "rithmic", "config", "rithmic.env"))
 	if err != nil {
 		return false
 	}
@@ -328,7 +210,7 @@ func (s *service) start() {
 	c.Dir = s.dir
 	c.Env = append(os.Environ(), s.env...)
 	c.Stdout, c.Stderr = lf, lf
-	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.SysProcAttr = plat.sysProcAttr()
 	if err := c.Start(); err != nil {
 		log.Printf("%s : lancement %v", s.name, err)
 		lf.Close()
@@ -348,17 +230,17 @@ func (s *service) stop() {
 	if s.cmd != nil && s.cmd.Process != nil && s.cmd.ProcessState == nil {
 		pid = s.cmd.Process.Pid
 	} else {
-		pid = pidOnPort(s.port) // service externe (lancé par hfq-desktop / ailleurs)
+		pid = plat.pidOnPort(s.port) // service externe (lancé par hfq-desktop / ailleurs)
 	}
 	if pid == 0 {
 		return
 	}
 	log.Printf("%s : arrêt pid=%d", s.name, pid)
 	arbre := arbreProcessus()
-	killTree(pid)
-	for _, d := range descendants(pid, arbre) { // service externe : groupe partagé → tuer les fils un par un
+	plat.killTree(pid)
+	for _, d := range descendants(pid, arbre) { // service externe : fils tués un par un
 		if d != os.Getpid() {
-			killTree(d)
+			plat.killTree(d)
 		}
 	}
 	killPorts(s.port) // le port doit être réellement libéré
@@ -369,65 +251,41 @@ func services() []*service {
 	return []*service{
 		{
 			name: "hfq-server", port: 8765, managed: true,
-			bin: p + "/hfq-server", dir: p,
-			env: []string{
+			bin: filepath.Join(p, plat.exeName("hfq-server")), dir: p,
+			env: append([]string{
 				"HFQ_DATA_DIR=" + dataDir, "HFQ_BUREAU=1",
 				// hist_archive.py:182 honore cet override → _hist_live dans le data dir
-				"HFQ_HIST_LIVE=" + dataDir + "/_hist_live",
+				"HFQ_HIST_LIVE=" + filepath.Join(dataDir, "_hist_live"),
 				// amont live du proxy /live/* (capture_live.py:59) — sans elle,
 				// hfq-server envoie un Host vide à rithmic-live (refus DNS-rebinding)
 				"HFQ_HUB=http://127.0.0.1:8792",
-				"SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
-				"SSL_CERT_DIR=/etc/ssl/certs",
-			},
+			}, plat.sslCertEnv()...),
 		},
 		{
 			name: "rithmic-live", port: 8792, managed: false,
-			bin: p + "/native/target/release/rithmic-live",
-			args: []string{"--env", dataDir + "/native/rithmic/config/rithmic.env"},
-			dir:  p,
-			env:  []string{"HFQ_DATA_DIR=" + dataDir},
+			bin:   filepath.Join(p, "native", "target", "release", plat.exeName("rithmic-live")),
+			args:  []string{"--env", filepath.Join(dataDir, "native", "rithmic", "config", "rithmic.env")},
+			dir:   p,
+			env:   []string{"HFQ_DATA_DIR=" + dataDir},
 		},
 		{
 			name: "tt-agent", port: 9199, managed: true,
-			bin:  p + "/tt-agent/node/node",
-			args: []string{p + "/tt-agent/server/index.js"},
-			dir:  p + "/tt-agent",
+			bin:  filepath.Join(p, "tt-agent", "node", plat.exeName("node")),
+			args: []string{filepath.Join(p, "tt-agent", "server", "index.js")},
+			dir:  filepath.Join(p, "tt-agent"),
 			env: []string{
 				"HFQ_DATA_DIR=" + dataDir,
 				"OMB_PORT=9199", "OMB_WEBHOOK_PORT=9200",
-				"OMB_STATIC_DIR=" + p + "/tt-agent/ui",
-				"OMB_DATA_DIR=" + dataDir + "/tt-agent",
-				"OMB_EXTRA_PATH=" + p + "/tt-agent/node",
-				"OMB_FORBIDDEN_ROOTS=" + dataDir + ":" + p,
+				"OMB_STATIC_DIR=" + filepath.Join(p, "tt-agent", "ui"),
+				"OMB_DATA_DIR=" + filepath.Join(dataDir, "tt-agent"),
+				"OMB_EXTRA_PATH=" + filepath.Join(p, "tt-agent", "node"),
+				"OMB_FORBIDDEN_ROOTS=" + dataDir + string(os.PathListSeparator) + p,
 			},
 		},
 	}
 }
 
-func singleInstance() {
-	f, err := os.OpenFile(filepath.Join(dataDir, "tt-tray.lock"),
-		os.O_CREATE|os.O_RDWR, 0o644)
-	if err != nil {
-		return
-	}
-	if syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil {
-		fmt.Fprintln(os.Stderr, "tt-tray tourne déjà")
-		os.Exit(1)
-	}
-}
-
-func openURL(u string) { exec.Command("xdg-open", u).Start() }
-
 // ---------- check de version ----------
-
-func installedVersion() string {
-	out, err := exec.Command("dpkg-query", "-W", "-f=${Version}", "turning-trade-terminal").Output()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(out))
-}
 
 // versionNewer : a strictement plus récente que b (comparaison par segments numériques).
 func versionNewer(a, b string) bool {
@@ -447,12 +305,9 @@ func versionNewer(a, b string) bool {
 	return false
 }
 
-// latestPublished : version du .deb publié sur le site (nom de fichier fixe,
-// écrasé à chaque release). Repli sur les manifests Tauri si la lecture échoue.
-func latestPublished() string {
-	if v := publishedDebVersion(); v != "" {
-		return v
-	}
+// latestManifestPublished : meilleure version trouvée dans les manifests
+// Tauri — repli commun (stale côté serveur, cf. commentaire manifestNames).
+func latestManifestPublished() string {
 	cli := &http.Client{Timeout: 10 * time.Second}
 	best := ""
 	for _, name := range manifestNames {
@@ -472,91 +327,6 @@ func latestPublished() string {
 	return best
 }
 
-// publishedDebVersion : lit le champ Version du control.tar en tête du .deb
-// publié — une requête Range de 256 Ko suffit, pas besoin des ~500 Mo.
-func publishedDebVersion() string {
-	req, err := http.NewRequest("GET", debURL, nil)
-	if err != nil {
-		return ""
-	}
-	req.Header.Set("Range", "bytes=0-262143")
-	cli := &http.Client{Timeout: 15 * time.Second}
-	resp, err := cli.Do(req)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		return ""
-	}
-	head, err := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
-	if err != nil {
-		return ""
-	}
-	return debControlVersion(head)
-}
-
-// debControlVersion : parcourt les membres de l'archive ar et extrait la
-// Version du fichier control (control.tar.gz uniquement — xz/zst non gérés).
-func debControlVersion(buf []byte) string {
-	if len(buf) < 68 || string(buf[:8]) != "!<arch>\n" {
-		return ""
-	}
-	pos := 8
-	for pos+60 <= len(buf) {
-		hdr := buf[pos : pos+60]
-		name := strings.TrimSpace(string(hdr[:16]))
-		size, err := strconv.Atoi(strings.TrimSpace(string(hdr[48:58])))
-		if err != nil || size < 0 {
-			return ""
-		}
-		body := buf[pos+60:]
-		if len(body) > size {
-			body = body[:size]
-		}
-		if strings.HasPrefix(name, "control.tar") {
-			return tarControlVersion(name, body)
-		}
-		pos += 60 + size + size%2
-	}
-	return ""
-}
-
-func tarControlVersion(name string, blob []byte) string {
-	var r io.Reader = bytes.NewReader(blob)
-	switch {
-	case strings.HasSuffix(name, ".gz"):
-		gz, err := gzip.NewReader(r)
-		if err != nil {
-			return ""
-		}
-		defer gz.Close()
-		r = gz
-	case !strings.HasSuffix(name, ".tar"):
-		return ""
-	}
-	tr := tar.NewReader(r)
-	for {
-		h, err := tr.Next()
-		if err != nil {
-			return ""
-		}
-		if filepath.Base(h.Name) != "control" {
-			continue
-		}
-		b, err := io.ReadAll(io.LimitReader(tr, 64<<10))
-		if err != nil {
-			return ""
-		}
-		for _, line := range strings.Split(string(b), "\n") {
-			if v, ok := strings.CutPrefix(line, "Version:"); ok {
-				return strings.TrimSpace(v)
-			}
-		}
-		return ""
-	}
-}
-
 var (
 	updLastPub  string // dernière version publiée vue
 	updNotified string // version déjà notifiée (une notif par version)
@@ -569,9 +339,9 @@ func checkUpdate(item *systray.MenuItem) {
 	}
 	updChecking = true
 	defer func() { updChecking = false }()
-	pub := latestPublished()
+	pub := plat.latestPublished()
 	updLastPub = pub
-	updateLabel(item, pub, installedVersion())
+	updateLabel(item, pub, plat.installedVersion())
 }
 
 // refreshUpdateLabel : recalcule le libellé avec la version publiée en cache —
@@ -580,7 +350,7 @@ func refreshUpdateLabel(item *systray.MenuItem) {
 	if updLastPub == "" {
 		return
 	}
-	updateLabel(item, updLastPub, installedVersion())
+	updateLabel(item, updLastPub, plat.installedVersion())
 }
 
 func updateLabel(item *systray.MenuItem, pub, inst string) {
@@ -594,8 +364,8 @@ func updateLabel(item *systray.MenuItem, pub, inst string) {
 		if updNotified != pub {
 			updNotified = pub
 			log.Printf("nouvelle version publiée : %s (installée %s)", pub, inst)
-			exec.Command("notify-send", "TurningTrade",
-				fmt.Sprintf("Nouvelle version publiée : %s (installée : %s)", pub, inst)).Run()
+			plat.notify("TurningTrade",
+				fmt.Sprintf("Nouvelle version publiée : %s (installée : %s)", pub, inst))
 		}
 	case versionNewer(inst, pub):
 		item.SetTitle(fmt.Sprintf("Màj : %s installée, site à %s (build non publié)", inst, pub))
@@ -606,11 +376,11 @@ func updateLabel(item *systray.MenuItem, pub, inst string) {
 
 // updateAvailable : vrai si la dernière version publiée dépasse l'installée.
 func updateAvailable() bool {
-	return updLastPub != "" && installedVersion() != "" && versionNewer(updLastPub, installedVersion())
+	return updLastPub != "" && plat.installedVersion() != "" && versionNewer(updLastPub, plat.installedVersion())
 }
 
 func main() {
-	singleInstance()
+	plat.singleInstance()
 	os.MkdirAll(logDir, 0o755)
 	lf, _ := os.OpenFile(filepath.Join(logDir, "tt-tray.log"),
 		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
@@ -626,7 +396,7 @@ func main() {
 }
 
 func onReady(svcs []*service) {
-	systray.SetIcon(iconPNG)
+	systray.SetIcon(trayIcon)
 	systray.SetTitle("")
 	systray.SetTooltip("TurningTrade")
 
@@ -660,12 +430,16 @@ func onReady(svcs []*service) {
 						f.Close()
 					}
 				}
-				openURL("file://" + path)
+				plat.openLocal(path)
 			}
 		}(it, p, lf.file == "")
 	}
 	mExt := systray.AddMenuItem("Ouvrir les indicateurs", filepath.Join(dataDir, "extensions"))
 	mUpdate := systray.AddMenuItem("Màj : vérification…", "Compare la version installée à la dernière publiée")
+	if !plat.updateCheckEnabled() {
+		mUpdate.SetTitle("Màj : non dispo sous Windows")
+		mUpdate.Disable()
+	}
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("Quitter", "Arrête les services lancés par tt-tray")
 
@@ -686,17 +460,19 @@ func onReady(svcs []*service) {
 		for {
 			select {
 			case <-mTerm.ClickedCh:
-				openURL(terminalURL)
+				plat.openURL(terminalURL)
 			case <-mAgent.ClickedCh:
-				openURL(agentURL)
+				plat.openURL(agentURL)
 			case <-mExt.ClickedCh:
 				os.MkdirAll(filepath.Join(dataDir, "extensions"), 0o755)
-				openURL("file://" + filepath.Join(dataDir, "extensions"))
+				plat.openLocal(filepath.Join(dataDir, "extensions"))
 			case <-mUpdate.ClickedCh:
-				if updateAvailable() {
-					openURL(downloadURL)
-				} else {
-					go checkUpdate(mUpdate)
+				if plat.updateCheckEnabled() {
+					if updateAvailable() {
+						plat.openURL(downloadURL)
+					} else {
+						go checkUpdate(mUpdate)
+					}
 				}
 			case <-mStartAll.ClickedCh:
 				for _, s := range svcs {
@@ -723,18 +499,13 @@ func onReady(svcs []*service) {
 		n := 0
 		for range time.Tick(2 * time.Second) {
 			n++
-			if n%30 == 0 { // chaque minute : rafraîchit le libellé Màj (local, sans réseau)
+			if n%30 == 0 && plat.updateCheckEnabled() { // chaque minute : libellé Màj (local, sans réseau)
 				refreshUpdateLabel(mUpdate)
 			}
 			for _, s := range svcs {
-				// auto-heal : un fils gelé (SIGSTOP/SIGTSTP → état T) est réveillé
+				// auto-heal : un fils gelé est réveillé (no-op sous Windows)
 				if s.cmd != nil && s.cmd.Process != nil && s.cmd.ProcessState == nil {
-					if st, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", s.cmd.Process.Pid)); err == nil {
-						if i := strings.LastIndexByte(string(st), ')'); i >= 0 && i+2 < len(st) && st[i+2] == 'T' {
-							log.Printf("%s : processus suspendu (état T) → SIGCONT", s.name)
-							s.cmd.Process.Signal(syscall.SIGCONT)
-						}
-					}
+					plat.resumeIfSuspended(s.cmd.Process.Pid)
 				}
 				var label string
 				switch {
@@ -750,12 +521,14 @@ func onReady(svcs []*service) {
 		}
 	}()
 
-	go func() { // check de version : 15 s après le démarrage, puis toutes les 2 h
-		time.Sleep(15 * time.Second)
-		checkUpdate(mUpdate)
-		for range time.Tick(2 * time.Hour) {
+	if plat.updateCheckEnabled() { // check de version : 15 s après le démarrage, puis toutes les 2 h
+		go func() {
+			time.Sleep(15 * time.Second)
 			checkUpdate(mUpdate)
-		}
-	}()
+			for range time.Tick(2 * time.Hour) {
+				checkUpdate(mUpdate)
+			}
+		}()
+	}
 
 }
