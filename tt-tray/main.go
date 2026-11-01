@@ -398,7 +398,7 @@ func main() {
 func onReady(svcs []*service) {
 	systray.SetIcon(trayIcon)
 	systray.SetTitle("")
-	systray.SetTooltip("TurningTrade")
+	systray.SetTooltip("TurningTrade Tray")
 
 	mTerm := systray.AddMenuItem("Ouvrir le Terminal", "http://127.0.0.1:8765")
 	mAgent := systray.AddMenuItem("Ouvrir TT Agent", "http://127.0.0.1:9199")

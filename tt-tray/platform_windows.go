@@ -199,7 +199,10 @@ func (windowsPlatform) openURL(u string) {
 	hidden(exec.Command("rundll32", "url.dll,FileProtocolHandler", u)).Start()
 }
 func (windowsPlatform) openLocal(path string) {
-	hidden(exec.Command("explorer", path)).Start()
+	// explorer gère fichiers ET dossiers (équivalent xdg-open). PAS de
+	// HideWindow : le flag s'appliquerait à la fenêtre principale d'explorer
+	// et l'ouvrirait invisible.
+	exec.Command("explorer", path).Start()
 }
 func (windowsPlatform) notify(title, msg string) {
 	log.Printf("%s : %s", title, msg)
