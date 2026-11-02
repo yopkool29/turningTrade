@@ -1,0 +1,79 @@
+{
+  "instances": {
+    "grok": {
+      "driver": "grokAgent"
+    },
+    "kimi": {
+      "driver": "kimiAgent"
+    },
+    "droid": {
+      "driver": "droidAgent"
+    },
+    "cursor": {
+      "driver": "cursorAgent"
+    },
+    "claude": {
+      "driver": "claudeAgent"
+    },
+    "codex": {
+      "driver": "codex"
+    },
+    "antigravity": {
+      "driver": "antigravityAgent"
+    },
+    "opencodeGo": {
+      "driver": "opencodeGo"
+    },
+    "computer": {
+      "driver": "boxAgent"
+    },
+    "openaiCompat": {
+      "driver": "openai-compat"
+    },
+    "qwen": {
+      "driver": "qwenAgent"
+    },
+    "hermes": {
+      "driver": "hermesAgent"
+    },
+    "pi": {
+      "driver": "piAgent"
+    },
+    "devin": {
+      "driver": "customAcp",
+      "displayName": "Devin",
+      "config": {
+        "cli": "C:/Users/user/AppData/Local/TurningTrade/tt-agent/devin-acp.js"
+      },
+      "environment": {
+        "DEVIN_ACP_MODEL": "swe-2-high"
+      }
+    }
+  },
+  "onboarding": {
+    "completedAt": "2026-11-02T16:45:28.145Z",
+    "version": 1,
+    "hintsSeen": [
+      "tour.agents",
+      "tour.new",
+      "tour.threads",
+      "tour.composer",
+      "tour.approval",
+      "tour.model",
+      "tour.dictate",
+      "tour.call",
+      "tour.computer",
+      "tour.computer-browser",
+      "tour.inspector",
+      "tour.mcp",
+      "tour.apps-desk",
+      "tour.done",
+      "spot.approval"
+    ]
+  },
+  "budgets": {},
+  "defaultModelSelection": {
+    "instanceId": "devin",
+    "model": "agent-default"
+  }
+}
